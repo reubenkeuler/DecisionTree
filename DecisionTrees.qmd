@@ -1,0 +1,470 @@
+---
+title: "Classification and Regression Trees (CART)"
+format: pdf
+editor: visual
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+
+#### ---------------------------------------------------------------------------
+### Load libraries and dataset
+
+```{r}
+library(tidyverse)
+library(tidymodels)   
+tidymodels_prefer()
+library(rpart)   # for modeling decision trees
+library(rpart.plot)   # for plotting decision trees
+library(vip)          
+
+ames <- read_csv("AmesHousing.csv")   # load dataset
+
+# convert all character variables to factor variables
+ames <- ames |>
+  mutate(across(where(is.character), as.factor))
+
+```
+
+
+
+#### ---------------------------------------------------------------------------
+### Data exploration
+
+```{r}
+library(skimr)
+
+skim(ames)
+
+# mix of numerical and categorical (ordinal and nominal) features
+# 113 missing entries in 'Gr_Liv_Area'
+# feature 'Overall_Qual' is ordinal, levels need to be reordered
+# numerical features have different SDs
+
+```
+
+
+```{r}
+# reorder levels of 'Overall_Qual' (default order is alphabetical)
+
+ames <- ames |>
+  mutate(Overall_Qual = factor(Overall_Qual,
+                               levels = c("Very_Poor", "Poor", "Fair", "Below_Average",
+                                          "Average", "Above_Average", "Good", "Very_Good",
+                                          "Excellent", "Very_Excellent")))
+
+```
+
+
+
+#### ---------------------------------------------------------------------------
+### Data splitting
+
+```{r}
+# data splitting
+
+set.seed(208)
+
+ames_split <- initial_split(data = ames, prop = 0.8)
+
+ames_train <- training(ames_split)   # training set
+ames_test <- testing(ames_split)     # test set
+
+```
+
+
+```{r}
+library(caret)
+
+nearZeroVar(ames_train, saveMetrics = TRUE)
+
+# five nzv features - 'Street', 'Utilities', 'Pool_Area', 'Screen_Porch', 'Misc_Val'
+
+```
+
+
+
+#### ---------------------------------------------------------------------------
+### Recipe and blueprint
+
+```{r}
+# create the feature engineering blueprint
+
+ames_blueprint <- recipe(Sale_Price ~ ., data = ames_train) |>
+  step_nzv(Street, Utilities, Pool_Area, Screen_Porch, Misc_Val) |>   # remove nzv features
+  step_impute_mean(Gr_Liv_Area) |>                                    # impute missing entries
+  step_integer(Overall_Qual) |>                                       # label encoding
+  step_normalize(all_numeric_predictors()) |>                         # center and scale
+  step_other(Neighborhood, threshold = 0.01, other = "other") |>      # lump rare neighborhoods
+  step_dummy(all_nominal_predictors(), one_hot = FALSE)               # dummy encode
+
+```
+
+
+```{r}
+# blueprint check
+# summary of engineered training set
+
+ames_blueprint |> 
+  prep() |> 
+  bake(new_data = NULL) |> 
+  skimr::skim()
+
+```
+
+
+```{r}
+# blueprint check
+# summary of engineered test set
+
+ames_blueprint |> 
+  prep() |> 
+  bake(new_data = ames_test) |> 
+  skimr::skim()
+
+```
+
+
+
+#### ---------------------------------------------------------------------------
+### Model specification and workflow
+
+```{r}
+# model specification: cost_complexity (rpart's cp) to be tuned
+# tree_depth and min_n are set to rpart's own defaults 
+# they are hyperparameters too, and could be tuned
+
+tree_spec <- decision_tree(cost_complexity = tune(),
+                           tree_depth = 30,   # rpart's maxdepth
+                           min_n = 20) |>     # rpart's minsplit
+  set_engine("rpart") |>
+  set_mode("regression")   # use "classification" for classification tasks
+
+
+# workflow
+tree_wf <- workflow() |>
+  add_recipe(ames_blueprint) |>
+  add_model(tree_spec)
+
+```
+
+
+
+#### ---------------------------------------------------------------------------
+### Cross-validation
+
+```{r}
+# CV specifications: 10 folds, 1 repeat
+
+set.seed(208)
+
+ames_folds <- vfold_cv(ames_train, 
+                       v = 10,
+                       repeats = 1)
+
+```
+
+
+```{r}
+# grid of 20 cost_complexity values, evenly spaced on the log10 scale
+# create a smaller grid if computationally expensive
+
+cp_grid <- grid_regular(cost_complexity(), levels = 20)
+# cp_min_n_grid <- grid_regular(cost_complexity(), min_n(), levels = 5)
+
+cp_grid
+
+```
+
+
+```{r}
+# implement CV to tune cost_complexity
+
+set.seed(208)
+
+tree_cv <- tune_grid(tree_wf,
+                     resamples = ames_folds,
+                     grid = cp_grid,
+                     metrics = metric_set(rmse, rsq))   # use appropriate metrics for classification tasks
+
+```
+
+
+```{r}
+# CV results
+
+collect_metrics(tree_cv)
+
+```
+
+
+```{r}
+# plotting CV results (x-axis is on the log10 scale)
+
+autoplot(tree_cv)
+
+```
+
+
+```{r}
+# top 5 cp values by RMSE
+
+show_best(tree_cv, metric = "rmse")  # use appropriate metrics for classification tasks
+
+```
+
+
+```{r}
+# optimal hyperparameter
+# use appropriate metrics for classification tasks
+
+best_cp <- select_best(tree_cv, metric = "rmse")
+best_cp
+
+best_cp_1se <- select_by_one_std_err(tree_cv, desc(cost_complexity), metric = "rmse")
+best_cp_1se
+
+```
+
+
+
+#### ---------------------------------------------------------------------------
+### Final model and test set evaluation
+
+```{r}
+# build optimal final model
+
+# plug best cp into the workflow
+final_tree_wf <- finalize_workflow(tree_wf, best_cp_1se)  # or use best_cp
+
+# fit on the full training set and evaluate once on the test set
+final_tree_fit <- last_fit(final_tree_wf,
+                           split = ames_split,
+                           metrics = metric_set(rmse, rsq)) # use appropriate metrics for classification tasks
+
+# test set RMSE and R-squared
+collect_metrics(final_tree_fit)  
+
+```
+
+
+```{r}
+#| eval: false
+
+# for general classification tasks and predictions on test set
+
+test_preds <- collect_predictions(final_tree_fit)
+
+# plug in the response variable name
+test_preds |>
+  select(<response>, .pred_class, .pred_Yes, .pred_No) |>
+  head()
+
+# confusion matrix
+test_preds |>
+  conf_mat(truth = <response>, estimate = .pred_class)
+
+# confusion matrix summary
+test_preds |>
+  conf_mat(truth = <response>, estimate = .pred_class) |> 
+  summary()
+
+# ROC curve (use the probability of the FIRST level, "Yes")
+test_preds |>
+  roc_curve(truth = <response>, .pred_Yes) |>
+  autoplot()
+
+# ROC AUC
+test_preds |>
+  roc_auc(truth = <response>, .pred_Yes)
+
+```
+
+
+```{r}
+#| eval: false
+
+# for project (since hotel_bookings_test doesn't include response)
+
+final_tree_wf <- finalize_workflow(tree_wf, best_cp)
+
+final_tree_fit <- fit(final_tree_wf, data = hotel_bookings_train)
+
+test_preds <- augment(final_tree_fit, new_data = hotel_bookings_test)
+
+# .pred_Yes = P(response = Yes), use this for Kaggle submission
+test_preds |>
+  select(id, .pred_class, .pred_Yes, .pred_No) |>
+  head()
+
+```
+
+
+
+#### ---------------------------------------------------------------------------
+### Tree summary and variable importance
+
+```{r}
+# pull out the underlying rpart object for rpart-specific tools
+tree_engine <- extract_fit_engine(final_tree_fit)
+
+# number of terminal nodes (leaves)
+sum(tree_engine$frame$var == "<leaf>")
+
+```
+
+
+```{r}
+# detailed model summary (long output!)
+
+summary(tree_engine)
+
+```
+
+
+```{r}
+# visualize tree
+
+rpart.plot(tree_engine, roundint = FALSE)
+
+```
+
+
+```{r}
+# variable importance
+
+tree_vi <- vip::vi(tree_engine) |> 
+  mutate(Importance_pct = round(100 * Importance / sum(Importance), 1))
+
+# variable importance plot
+tree_vi |>
+  slice_max(Importance_pct, n = 15) |>
+  ggplot(aes(x = Importance_pct, y = fct_reorder(Variable, Importance_pct))) +
+  geom_col() +
+  scale_y_discrete(labels = function(x) str_trunc(x, 30)) +
+  labs(y = NULL)
+
+```
+
+
+
+#### ---------------------------------------------------------------------------
+### Regression tree (no pruning): Ames Housing dataset
+
+```{r}
+# same workflow, new model spec: cost_complexity = 0 means no pruning
+
+# model specification
+tree_noprune_spec <- decision_tree(cost_complexity = 0,
+                                   tree_depth = 30,
+                                   min_n = 20) |>
+  set_engine("rpart") |>
+  set_mode("regression")   # use "classification" for classification tasks
+
+
+# workflow
+tree_noprune_wf <- tree_wf |>
+  update_model(tree_noprune_spec)
+
+```
+
+
+```{r}
+# fit on training set, evaluate on test set
+
+noprune_fit <- last_fit(tree_noprune_wf,
+                        split = ames_split,
+                        metrics = metric_set(rmse, rsq))
+
+# test set RMSE
+collect_metrics(noprune_fit)
+
+```
+
+
+```{r}
+# number of leaves: pruned vs. unpruned
+
+sum(extract_fit_engine(noprune_fit)$frame$var == "<leaf>")
+
+```
+
+
+```{r}
+# visualize tree
+
+rpart.plot(extract_fit_engine(noprune_fit), roundint = FALSE)
+
+```
+
+
+
+#### ---------------------------------------------------------------------------
+### Regression tree (minimal feature engineering): Ames Housing dataset
+
+```{r}
+# new blueprint: only impute the missing entries
+
+ames_blueprint_min <- recipe(Sale_Price ~ ., data = ames_train) |>
+  step_impute_mean(Gr_Liv_Area)
+
+
+# same workflow, new recipe
+tree_min_wf <- tree_wf |>
+  update_recipe(ames_blueprint_min)
+
+```
+
+
+```{r}
+# implement CV to tune cost_complexity
+# same folds and same grid as before, so the comparison is fair
+
+tree_cv_min <- tune_grid(tree_min_wf,
+                         resamples = ames_folds,
+                         grid = cp_grid,
+                         metrics = metric_set(rmse, rsq))
+
+```
+
+
+```{r}
+# CV results
+
+collect_metrics(tree_cv_min)
+
+```
+
+
+```{r}
+# optimal hyperparameter
+# use appropriate metrics for classification tasks
+
+best_cp_min <- select_best(tree_cv_min, metric = "rmse")
+best_cp_min
+
+best_cp_1se_min <- select_by_one_std_err(tree_cv_min, desc(cost_complexity), metric = "rmse")
+best_cp_1se_min
+
+```
+
+
+```{r}
+# DEMONSTRATION
+# compare the best CV RMSE: full feature engineering vs. minimal
+
+bind_rows(
+  full_fe = show_best(tree_cv, metric = "rmse", n = 1),
+  minimal_fe = show_best(tree_cv_min, metric = "rmse", n = 1),
+  .id = "recipe"
+) |>
+  select(recipe, cost_complexity, mean, std_err)
+
+```
+
+
+#### ---------------------------------------------------------------------------
+
+
